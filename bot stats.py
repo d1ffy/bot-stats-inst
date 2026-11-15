@@ -11,7 +11,6 @@ from aiogram.types import FSInputFile
 from fpdf import FPDF
 from rapidocr_onnxruntime import RapidOCR
 
-# Загружаем переменные из .env
 load_dotenv()
 
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -49,11 +48,37 @@ def ensure_fonts():
 
     for url, path in [(FONT_REGULAR_URL, FONT_REGULAR_PATH), (FONT_BOLD_URL, FONT_BOLD_PATH)]:
         if not os.path.exists(path):
-            print(f"Скачиваю шрифт: {url} ...")
             resp = requests.get(url, proxies=proxies, timeout=20)
             resp.raise_for_status()
             with open(path, "wb") as f:
                 f.write(resp.content)
+
+
+def extract_reel_plays(L: instaloader.Instaloader, post: instaloader.Post) -> int:
+    """Достаёт реальные воспроизведения Reels из play_count / video_play_count."""
+    node = getattr(post, "_node", {}) or {}
+    for key in ("play_count", "video_play_count", "video_view_count"):
+        val = node.get(key)
+        if isinstance(val, int) and val > 0:
+            return val
+
+    if post.video_view_count and post.video_view_count > 0:
+        return post.video_view_count
+
+    # Если в общей ленте инста скрыла счётчик, догружаем полную карточку ролика
+    try:
+        full_post = instaloader.Post.from_shortcode(L.context, post.shortcode)
+        full_node = getattr(full_post, "_node", {}) or {}
+        for key in ("play_count", "video_play_count", "video_view_count"):
+            val = full_node.get(key)
+            if isinstance(val, int) and val > 0:
+                return val
+        if full_post.video_view_count:
+            return full_post.video_view_count
+    except Exception:
+        pass
+
+    return 0
 
 
 def scrape_public_stats():
@@ -87,10 +112,12 @@ def scrape_public_stats():
         if post.is_video:
             raw_cap = (post.caption or "Без описания").replace("\n", " ").strip()
             title = (raw_cap[:42] + "...") if len(raw_cap) > 42 else raw_cap
+            views = extract_reel_plays(L, post)
+
             reels_data.append({
                 "date": post.date_local.strftime("%d.%m.%Y"),
                 "title": title,
-                "views": post.video_view_count or 0,
+                "views": views,
                 "likes": post.likes or 0,
                 "comments": post.comments or 0,
             })
