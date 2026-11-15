@@ -5,6 +5,7 @@ from datetime import datetime
 import requests
 from dotenv import load_dotenv
 import instaloader
+import yt_dlp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
@@ -42,7 +43,6 @@ album_tasks = {}
 
 
 def ensure_fonts():
-    """Скачивает шрифты из интернета в папку fonts/, если их ещё нет локально."""
     os.makedirs("fonts", exist_ok=True)
     proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
@@ -54,35 +54,51 @@ def ensure_fonts():
                 f.write(resp.content)
 
 
-def extract_reel_plays(L: instaloader.Instaloader, post: instaloader.Post) -> int:
-    """Достаёт реальные воспроизведения Reels из play_count / video_play_count."""
-    node = getattr(post, "_node", {}) or {}
-    for key in ("play_count", "video_play_count", "video_view_count"):
-        val = node.get(key)
-        if isinstance(val, int) and val > 0:
-            return val
+def scrape_reels_via_ytdlp(username: str, limit: int = 8) -> list:
+    """Забирает статистику Reels (включая реальные просмотры) напрямую со вкладки /reels/."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+        "playlistend": limit,
+        "skip_download": True,
+    }
+    if PROXY_URL:
+        ydl_opts["proxy"] = PROXY_URL
 
-    if post.video_view_count and post.video_view_count > 0:
-        return post.video_view_count
+    reels_url = f"https://www.instagram.com/{username}/reels/"
+    reels_data = []
 
-    # Если в общей ленте инста скрыла счётчик, догружаем полную карточку ролика
-    try:
-        full_post = instaloader.Post.from_shortcode(L.context, post.shortcode)
-        full_node = getattr(full_post, "_node", {}) or {}
-        for key in ("play_count", "video_play_count", "video_view_count"):
-            val = full_node.get(key)
-            if isinstance(val, int) and val > 0:
-                return val
-        if full_post.video_view_count:
-            return full_post.video_view_count
-    except Exception:
-        pass
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(reels_url, download=False)
+        entries = info.get("entries", []) if info else []
 
-    return 0
+        for item in entries:
+            if not item:
+                continue
+            raw_desc = (item.get("description") or item.get("title") or "Без описания").replace("\n", " ").strip()
+            title = (raw_desc[:42] + "...") if len(raw_desc) > 42 else raw_desc
+
+            ts = item.get("timestamp")
+            date_str = datetime.fromtimestamp(ts).strftime("%d.%m.%Y") if ts else "—"
+
+            views = item.get("view_count") or item.get("play_count") or 0
+            likes = item.get("like_count") or 0
+            comments = item.get("comment_count") or 0
+
+            reels_data.append({
+                "date": date_str,
+                "title": title,
+                "views": int(views),
+                "likes": int(likes),
+                "comments": int(comments),
+            })
+
+    return reels_data
 
 
 def scrape_public_stats():
-    """Шаг 1: Парсит публичную статистику профиля и последних Reels."""
+    """Шаг 1: Собирает подписчиков через instaloader и Reels с просмотрами через yt-dlp."""
     L = instaloader.Instaloader(
         download_pictures=False,
         download_videos=False,
@@ -90,39 +106,42 @@ def scrape_public_stats():
         save_metadata=False,
         compress_json=False,
     )
-
     if PROXY_URL:
-        L.context._session.proxies = {
-            "http": PROXY_URL,
-            "https": PROXY_URL,
-        }
+        L.context._session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
 
     profile = instaloader.Profile.from_username(L.context, IG_USERNAME)
-
     acc_info = {
         "username": profile.username,
         "followers": profile.followers,
         "mediacount": profile.mediacount,
     }
 
+    # Пробуем забрать Reels через yt-dlp (он видит play_count)
     reels_data = []
-    checked = 0
-    for post in profile.get_posts():
-        checked += 1
-        if post.is_video:
-            raw_cap = (post.caption or "Без описания").replace("\n", " ").strip()
-            title = (raw_cap[:42] + "...") if len(raw_cap) > 42 else raw_cap
-            views = extract_reel_plays(L, post)
+    try:
+        reels_data = scrape_reels_via_ytdlp(IG_USERNAME, limit=8)
+    except Exception:
+        pass
 
-            reels_data.append({
-                "date": post.date_local.strftime("%d.%m.%Y"),
-                "title": title,
-                "views": views,
-                "likes": post.likes or 0,
-                "comments": post.comments or 0,
-            })
-        if len(reels_data) >= 8 or checked >= 20:
-            break
+    # Резервный вариант через instaloader, если yt-dlp временно заблокирован
+    if not reels_data:
+        checked = 0
+        for post in profile.get_posts():
+            checked += 1
+            if post.is_video:
+                raw_cap = (post.caption or "Без описания").replace("\n", " ").strip()
+                title = (raw_cap[:42] + "...") if len(raw_cap) > 42 else raw_cap
+                node = getattr(post, "_node", {}) or {}
+                views = node.get("play_count") or node.get("video_play_count") or post.video_view_count or 0
+                reels_data.append({
+                    "date": post.date_local.strftime("%d.%m.%Y"),
+                    "title": title,
+                    "views": int(views),
+                    "likes": int(post.likes or 0),
+                    "comments": int(post.comments or 0),
+                })
+            if len(reels_data) >= 8 or checked >= 20:
+                break
 
     return acc_info, reels_data
 
@@ -285,7 +304,7 @@ def build_final_pdf(session: dict, filename: str):
 
     for r in reels:
         y_row = pdf.get_y() + 2
-        er = round(((r["likes"] + r["comments"]) / max(r["views"], 1)) * 100, 1)
+        er_str = f"{round(((r['likes'] + r['comments']) / r['views']) * 100, 1)}%" if r["views"] > 0 else "—"
 
         pdf.set_xy(10, y_row)
         pdf.set_font("MainFont", "", 7.5)
@@ -304,7 +323,7 @@ def build_final_pdf(session: dict, filename: str):
 
         pdf.set_font("MainFont", "B", 9.5)
         pdf.set_text_color(0, 102, 204)
-        pdf.cell(col_widths[4], 6, f"{er}%", align="R")
+        pdf.cell(col_widths[4], 6, er_str, align="R")
 
         pdf.set_y(y_row + 11)
         pdf.set_draw_color(242, 242, 247)
