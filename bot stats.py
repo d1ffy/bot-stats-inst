@@ -1,445 +1,499 @@
 import asyncio
+import json
 import os
-import re
-from datetime import datetime
-import requests
-from dotenv import load_dotenv
-import instaloader
-import yt_dlp
+import sqlite3
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.types import FSInputFile
-from fpdf import FPDF
-from rapidocr_onnxruntime import RapidOCR
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+from faster_whisper import WhisperModel
+from openai import AsyncOpenAI
 
 load_dotenv()
 
 TG_TOKEN = os.getenv("TG_TOKEN")
-IG_USERNAME = os.getenv("IG_USERNAME", "d1ffy.reels")
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
+MONTHLY_GOAL = int(os.getenv("MONTHLY_GOAL", "40000"))
 
-FONT_REGULAR_URL = os.getenv(
-    "FONT_REGULAR_URL",
-    "https://github.com/google/fonts/raw/main/ofl/firasans/FiraSans-Regular.ttf",
-)
-FONT_BOLD_URL = os.getenv(
-    "FONT_BOLD_URL",
-    "https://github.com/google/fonts/raw/main/ofl/firasans/FiraSans-Bold.ttf",
-)
-
-FONT_REGULAR_PATH = os.path.join("fonts", "Regular.ttf")
-FONT_BOLD_PATH = os.path.join("fonts", "Bold.ttf")
-
-if not TG_TOKEN:
-    raise ValueError("Не задан TG_TOKEN в файле .env")
+DB_PATH = "tracker.db"
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
-ocr = RapidOCR()
 
-user_sessions = {}
-album_buffers = {}
-album_tasks = {}
+# Клиент OpenRouter для разбора естественной речи в JSON
+llm = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
-
-def ensure_fonts():
-    os.makedirs("fonts", exist_ok=True)
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-
-    for url, path in [(FONT_REGULAR_URL, FONT_REGULAR_PATH), (FONT_BOLD_URL, FONT_BOLD_PATH)]:
-        if not os.path.exists(path):
-            resp = requests.get(url, proxies=proxies, timeout=20)
-            resp.raise_for_status()
-            with open(path, "wb") as f:
-                f.write(resp.content)
+# Лёгкая модель Whisper (работает на CPU любого VPS без видеокарты)
+print("Загружаю модель Whisper для распознавания голоса...")
+whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
 
 
-def scrape_reels_via_ytdlp(username: str, limit: int = 8) -> list:
-    """Забирает статистику Reels (включая реальные просмотры) напрямую со вкладки /reels/."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-        "playlistend": limit,
-        "skip_download": True,
-    }
-    if PROXY_URL:
-        ydl_opts["proxy"] = PROXY_URL
-
-    reels_url = f"https://www.instagram.com/{username}/reels/"
-    reels_data = []
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(reels_url, download=False)
-        entries = info.get("entries", []) if info else []
-
-        for item in entries:
-            if not item:
-                continue
-            raw_desc = (item.get("description") or item.get("title") or "Без описания").replace("\n", " ").strip()
-            title = (raw_desc[:42] + "...") if len(raw_desc) > 42 else raw_desc
-
-            ts = item.get("timestamp")
-            date_str = datetime.fromtimestamp(ts).strftime("%d.%m.%Y") if ts else "—"
-
-            views = item.get("view_count") or item.get("play_count") or 0
-            likes = item.get("like_count") or 0
-            comments = item.get("comment_count") or 0
-
-            reels_data.append({
-                "date": date_str,
-                "title": title,
-                "views": int(views),
-                "likes": int(likes),
-                "comments": int(comments),
-            })
-
-    return reels_data
+# ================= БАЗА ДАННЫХ (SQLite) =================
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client TEXT NOT NULL,
+                title TEXT NOT NULL,
+                total_videos INTEGER DEFAULT 1,
+                done_videos INTEGER DEFAULT 0,
+                total_amount INTEGER DEFAULT 0,
+                paid_amount INTEGER DEFAULT 0,
+                deadline TEXT,
+                status TEXT DEFAULT 'active',
+                rem_12h INTEGER DEFAULT 0,
+                rem_6h INTEGER DEFAULT 0,
+                rem_3h INTEGER DEFAULT 0,
+                rem_1h INTEGER DEFAULT 0,
+                created_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                deadline TEXT,
+                status TEXT DEFAULT 'active',
+                rem_12h INTEGER DEFAULT 0,
+                rem_6h INTEGER DEFAULT 0,
+                rem_3h INTEGER DEFAULT 0,
+                rem_1h INTEGER DEFAULT 0,
+                created_at TEXT
+            )
+        """)
 
 
-def scrape_public_stats():
-    """Шаг 1: Собирает подписчиков через instaloader и Reels с просмотрами через yt-dlp."""
-    L = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        save_metadata=False,
-        compress_json=False,
+# ================= ИИ-ПАРСЕР СООБЩЕНИЙ =================
+async def parse_user_intent(text: str) -> dict:
+    """Превращает голосовую расшифровку или текст в структурированный JSON."""
+    now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (%A)")
+    system_prompt = f"""
+Ты — точный парсер задач и заказов для видеомонтажёра.
+Текущее время пользователя: {now_str}.
+
+Определи, что хочет пользователь:
+1. "order" — новый заказ на монтаж (упомянут клиент, оплата, пакет роликов или монтаж для кого-то).
+2. "task" — личная или рабочая задача (например, "на завтра...", "смонтировать...", "купить...", "позвонить...").
+
+Правила времени:
+- Если сказано "завтра" без точного часа — ставь 12:00 завтрашнего дня.
+- Если сказано "сдать в пятницу" без часа — ставь 18:00 указанного дня.
+- Если время вообще не указано — ставь завтра в 12:00.
+- Формат deadline строго: "YYYY-MM-DD HH:MM".
+
+Верни СТРОГО валидный JSON без markdown-обёртки:
+{{
+  "type": "order" или "task",
+  "client": "Имя клиента (для order, иначе пусто)",
+  "title": "Суть заказа или задачи",
+  "total_videos": число (по умолчанию 1),
+  "total_amount": общая сумма в рублях числом (0 если не указано),
+  "paid_amount": внесённая предоплата числом (0 если не указано),
+  "deadline": "YYYY-MM-DD HH:MM"
+}}
+"""
+    resp = await llm.chat.completions.create(
+        model=OPENROUTER_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.1,
     )
-    if PROXY_URL:
-        L.context._session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-
-    profile = instaloader.Profile.from_username(L.context, IG_USERNAME)
-    acc_info = {
-        "username": profile.username,
-        "followers": profile.followers,
-        "mediacount": profile.mediacount,
-    }
-
-    # Пробуем забрать Reels через yt-dlp (он видит play_count)
-    reels_data = []
-    try:
-        reels_data = scrape_reels_via_ytdlp(IG_USERNAME, limit=8)
-    except Exception:
-        pass
-
-    # Резервный вариант через instaloader, если yt-dlp временно заблокирован
-    if not reels_data:
-        checked = 0
-        for post in profile.get_posts():
-            checked += 1
-            if post.is_video:
-                raw_cap = (post.caption or "Без описания").replace("\n", " ").strip()
-                title = (raw_cap[:42] + "...") if len(raw_cap) > 42 else raw_cap
-                node = getattr(post, "_node", {}) or {}
-                views = node.get("play_count") or node.get("video_play_count") or post.video_view_count or 0
-                reels_data.append({
-                    "date": post.date_local.strftime("%d.%m.%Y"),
-                    "title": title,
-                    "views": int(views),
-                    "likes": int(post.likes or 0),
-                    "comments": int(post.comments or 0),
-                })
-            if len(reels_data) >= 8 or checked >= 20:
-                break
-
-    return acc_info, reels_data
+    raw = resp.choices[0].message.content.strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    return json.loads(raw)
 
 
-def parse_metric_number(raw: str) -> int:
-    s = raw.lower().replace("\xa0", " ").strip()
-    mult = 1
-    if "тыс" in s or "k" in s:
-        mult = 1000
-    elif "млн" in s or "m" in s:
-        mult = 1_000_000
-
-    num_match = re.search(r"(\d+(?:[.,]\d+)?)", s.replace(" ", ""))
-    if not num_match:
-        return 0
-    try:
-        return int(float(num_match.group(1).replace(",", ".")) * mult)
-    except ValueError:
-        return 0
+def transcribe_audio(file_path: str) -> str:
+    segments, _ = whisper.transcribe(file_path, language="ru")
+    return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-def extract_private_metrics(image_path: str) -> dict:
-    """Шаг 2: Вытаскивает со скриншотов закрытые метрики."""
-    result, _ = ocr(image_path)
-    if not result:
-        return {}
-
-    lines = [item[1].strip() for item in result if item[1].strip()]
-    patterns = {
-        "reach": [r"охваченные аккаунты", r"общий охват", r"охват", r"accounts reached", r"reach"],
-        "profile_visits": [r"посещения профиля", r"визиты в профиль", r"действия в профиле", r"profile visits", r"profile activity"],
-        "link_clicks": [r"нажатия на внешнюю ссылку", r"клики по ссылке", r"external link taps", r"website taps"],
-        "shares": [r"репосты", r"пересылки", r"shares"],
-        "saves": [r"сохранения", r"saved", r"saves"],
-    }
-
-    extracted = {}
-    for i, line in enumerate(lines):
-        low = line.lower()
-        for key, kw_list in patterns.items():
-            if key in extracted:
-                continue
-            if any(re.search(kw, low) for kw in kw_list):
-                candidates = [line]
-                if i + 1 < len(lines):
-                    candidates.append(lines[i + 1])
-                if i - 1 >= 0:
-                    candidates.append(lines[i - 1])
-
-                for cand in candidates:
-                    if re.search(r"\d", cand):
-                        val = parse_metric_number(cand)
-                        if val > 0:
-                            extracted[key] = val
-                            break
-    return extracted
+# ================= КЛАВИАТУРЫ =================
+def main_menu_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📦 Заказы"), KeyboardButton(text="📅 На завтра")],
+            [KeyboardButton(text="📝 Все задачи"), KeyboardButton(text="💰 Касса")],
+        ],
+        resize_keyboard=True,
+    )
 
 
-class ReportPDF(FPDF):
-    def footer(self):
-        self.set_y(-14)
-        self.set_font("MainFont", "", 8)
-        self.set_text_color(142, 142, 147)
-        self.cell(0, 10, f"Гибридный отчёт • @{IG_USERNAME}   |   Стр. {self.page_no()}", align="R")
-
-
-def build_final_pdf(session: dict, filename: str):
-    acc = session["acc"]
-    reels = session["reels"]
-    priv = session["private"]
-
-    pdf = ReportPDF(orientation="P", unit="mm", format="A4")
-    pdf.add_font("MainFont", "", FONT_REGULAR_PATH)
-    pdf.add_font("MainFont", "B", FONT_BOLD_PATH)
-    pdf.set_auto_page_break(auto=True, margin=18)
-    pdf.add_page()
-
-    today = datetime.now().strftime("%d.%m.%Y")
-    total_views = sum(r["views"] for r in reels)
-    total_likes = sum(r["likes"] for r in reels)
-    total_comments = sum(r["comments"] for r in reels)
-
-    reach = priv.get("reach", 0)
-    visits = priv.get("profile_visits", 0)
-    clicks = priv.get("link_clicks", 0)
-    shares = priv.get("shares", 0)
-    saves = priv.get("saves", 0)
-
-    # Шапка
-    pdf.set_font("MainFont", "B", 20)
-    pdf.set_text_color(29, 29, 31)
-    pdf.cell(120, 10, f"Аналитика @{acc['username']}", ln=0)
-
-    pdf.set_font("MainFont", "", 10)
-    pdf.set_text_color(134, 134, 139)
-    pdf.cell(0, 10, f"Дата: {today}", align="R", ln=1)
-
-    pdf.set_font("MainFont", "", 10)
-    pdf.cell(0, 5, "Объединённая сводка: публичные метрики Reels + внутренняя воронка профиля", ln=1)
-    pdf.ln(6)
-
-    # 4 карточки KPI
-    cards = [
-        ("ПОДПИСЧИКИ", f"{acc['followers']:,}".replace(",", " ")),
-        ("ОХВАТ АККАУНТА", f"{reach:,}".replace(",", " ") if reach else "—"),
-        ("ВИЗИТЫ В ПРОФИЛЬ", f"{visits:,}".replace(",", " ") if visits else "—"),
-        ("КЛИКИ В TELEGRAM", f"{clicks:,}".replace(",", " ") if clicks else "—"),
+def order_inline_kb(order_id: int, has_debt: bool):
+    buttons = [
+        [
+            InlineKeyboardButton(text="🎬 +1 ролик", callback_data=f"ord_vid:{order_id}"),
+            InlineKeyboardButton(text="✅ Сдан", callback_data=f"ord_done:{order_id}"),
+        ]
     ]
-    card_w = 44.5
-    gap = 4
-    y_cards = pdf.get_y()
+    if has_debt:
+        buttons[0].insert(1, InlineKeyboardButton(text="💸 Доплатил", callback_data=f"ord_pay:{order_id}"))
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    for idx, (label, val) in enumerate(cards):
-        cx = 10 + idx * (card_w + gap)
-        pdf.set_fill_color(245, 245, 247)
-        pdf.rect(cx, y_cards, card_w, 22, style="F")
 
-        pdf.set_xy(cx + 3, y_cards + 3)
-        pdf.set_font("MainFont", "", 6.8)
-        pdf.set_text_color(110, 110, 115)
-        pdf.cell(card_w - 6, 4, label)
-
-        pdf.set_xy(cx + 3, y_cards + 9)
-        pdf.set_font("MainFont", "B", 14)
-        pdf.set_text_color(29, 29, 31)
-        pdf.cell(card_w - 6, 8, val)
-
-    pdf.set_y(y_cards + 28)
-
-    # Плашка воронки
-    ctr_str = f"{round((clicks / visits) * 100, 1)}%" if (visits > 0 and clicks > 0) else "н/д"
-    pdf.set_fill_color(240, 247, 255)
-    pdf.rect(10, pdf.get_y(), 190, 12, style="F")
-    pdf.set_xy(14, pdf.get_y() + 3)
-    pdf.set_font("MainFont", "", 9.5)
-    pdf.set_text_color(0, 85, 179)
-    pdf.cell(
-        0, 6,
-        f"Конверсия визит -> клик в ТГ: {ctr_str}   |   Со скринов: {shares} репостов, {saves} сохранений"
-    )
-    pdf.ln(17)
-
-    # Таблица спарсенных Reels
-    pdf.set_font("MainFont", "B", 13)
-    pdf.set_text_color(29, 29, 31)
-    pdf.cell(0, 8, f"Спарсенная статистика последних {len(reels)} Reels", ln=1)
-    pdf.ln(2)
-
-    col_widths = [92, 28, 22, 24, 24]
-    headers = ["Ролик", "Просмотры", "Лайки", "Комменты", "ER (от просм.)"]
-
-    pdf.set_font("MainFont", "B", 8.5)
-    pdf.set_text_color(134, 134, 139)
-    for i, h in enumerate(headers):
-        align = "L" if i == 0 else "R"
-        pdf.cell(col_widths[i], 7, h, align=align)
-    pdf.ln(7)
-    pdf.set_draw_color(229, 229, 234)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-
-    for r in reels:
-        y_row = pdf.get_y() + 2
-        er_str = f"{round(((r['likes'] + r['comments']) / r['views']) * 100, 1)}%" if r["views"] > 0 else "—"
-
-        pdf.set_xy(10, y_row)
-        pdf.set_font("MainFont", "", 7.5)
-        pdf.set_text_color(142, 142, 147)
-        pdf.cell(col_widths[0], 4, r["date"], ln=2)
-
-        pdf.set_font("MainFont", "B", 9)
-        pdf.set_text_color(29, 29, 31)
-        pdf.cell(col_widths[0], 5, r["title"])
-
-        pdf.set_xy(10 + col_widths[0], y_row + 2)
-        pdf.set_font("MainFont", "", 9.5)
-        pdf.cell(col_widths[1], 6, f"{r['views']:,}".replace(",", " "), align="R")
-        pdf.cell(col_widths[2], 6, str(r["likes"]), align="R")
-        pdf.cell(col_widths[3], 6, str(r["comments"]), align="R")
-
-        pdf.set_font("MainFont", "B", 9.5)
-        pdf.set_text_color(0, 102, 204)
-        pdf.cell(col_widths[4], 6, er_str, align="R")
-
-        pdf.set_y(y_row + 11)
-        pdf.set_draw_color(242, 242, 247)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-
-    pdf.ln(4)
-    pdf.set_font("MainFont", "B", 9.5)
-    pdf.set_text_color(29, 29, 31)
-    pdf.cell(
-        0, 6,
-        f"Итого по {len(reels)} роликам: {total_views:,} просмотров • {total_likes} лайков • {total_comments} комментариев".replace(",", " "),
-        align="R"
+def task_inline_kb(task_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"tsk_done:{task_id}")]
+        ]
     )
 
-    pdf.output(filename)
+
+# ================= ПРОВЕРКА ДОСТУПА =================
+def is_owner(message: types.Message) -> bool:
+    return ALLOWED_USER_ID == 0 or message.from_user.id == ALLOWED_USER_ID
 
 
-@dp.message(Command("start", "report"))
-async def cmd_start_report(message: types.Message):
-    user_id = message.from_user.id
-    msg = await message.answer("⏳ Шаг 1/2: Парсю публичную статистику профиля и последних Reels...")
-
-    try:
-        acc_info, reels_data = await asyncio.to_thread(scrape_public_stats)
-        user_sessions[user_id] = {
-            "acc": acc_info,
-            "reels": reels_data,
-            "private": {},
-        }
-
-        total_v = sum(r["views"] for r in reels_data)
-        prompt_text = (
-            f"✅ **Публичные данные собраны!**\n"
-            f"• Подписчики: `{acc_info['followers']}`\n"
-            f"• Найдено Reels: `{len(reels_data)}` (суммарно `{total_v:,}` просм.)\n\n"
-            f"📸 **Шаг 2/2: Кинь мне скриншоты того, что скрыто от парсера:**\n"
-            f"1️⃣ **Профессиональная панель → Охваченные аккаунты** (общий охват и визиты в профиль)\n"
-            f"2️⃣ **Профессиональная панель → Взаимодействия** (клики по ссылке в Telegram, репосты и сохранения)\n"
-            f"3️⃣ *(По желанию)* **Статистика топового Reels** (его репосты и сохранения)\n\n"
-            f"Кидай скрины прямо сюда (можно сразу альбомом) или нажми /skip, чтобы собрать PDF без них."
-        )
-        await msg.edit_text(prompt_text, parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Ошибка парсинга: {e}\nПроверь настройки VPN/DNS или ник `{IG_USERNAME}` в `.env`.")
+# ================= ОБРАБОТЧИКИ КОМАНД И МЕНЮ =================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    if not is_owner(message):
+        return
+    await message.answer(
+        "👋 **Личный трекер запущен.**\n\n"
+        "Просто запиши **голосовое** или напиши текстом:\n"
+        "• *«Новый заказ: Артём, 5 рилс за 7500, предоплата 3000, сдать в четверг в 18:00»*\n"
+        "• *«На завтра в 11:00 подобрать музыку и нарезать A-roll»*\n\n"
+        "Я сам занесу всё в базу и напомню за **12ч, 6ч, 3ч и 1ч** до дедлайна.",
+        reply_markup=main_menu_kb(),
+        parse_mode="Markdown",
+    )
 
 
-@dp.message(Command("skip"))
-async def cmd_skip(message: types.Message):
-    user_id = message.from_user.id
-    session = user_sessions.pop(user_id, None)
-    if not session:
-        await message.answer("Сначала запусти сбор командой /report")
+@dp.message(F.text.in_({"📦 Заказы", "/orders"}))
+async def show_orders(message: types.Message):
+    if not is_owner(message):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, client, title, total_videos, done_videos, total_amount, paid_amount, deadline "
+            "FROM orders WHERE status = 'active' ORDER BY deadline ASC"
+        ).fetchall()
+
+    if not rows:
+        await message.answer("Активных заказов пока нет. Надиктуй новый голосом!")
         return
 
-    pdf_path = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-    await asyncio.to_thread(build_final_pdf, session, pdf_path)
-    await message.answer_document(
-        document=FSInputFile(pdf_path),
-        caption="📊 Готово! Собрал PDF на основе спарсенных данных."
-    )
-    os.remove(pdf_path)
+    await message.answer(f"📦 **Активные заказы ({len(rows)}):**", parse_mode="Markdown")
+    for r in rows:
+        oid, client, title, tot_v, done_v, tot_a, paid_a, dl = r
+        debt = max(0, tot_a - paid_a)
+        dl_fmt = datetime.strptime(dl, "%Y-%m-%d %H:%M").strftime("%d.%m в %H:%M") if dl else "без срока"
+        text = (
+            f"👤 **{client}** — {title}\n"
+            f"🎬 Прогресс: `{done_v}/{tot_v}` роликов\n"
+            f"💵 Оплата: `{paid_a:,} / {tot_a:,} ₽` (остаток: `{debt:,} ₽`)\n"
+            f"⏰ Дедлайн: `{dl_fmt}`"
+        ).replace(",", " ")
+        await message.answer(text, reply_markup=order_inline_kb(oid, debt > 0), parse_mode="Markdown")
 
 
-async def finalize_with_screenshots(user_id: int, chat_id: int):
-    await asyncio.sleep(2.5)
-    paths = album_buffers.pop(user_id, [])
-    album_tasks.pop(user_id, None)
+@dp.message(F.text.in_({"📅 На завтра", "/tomorrow"}))
+async def show_tomorrow(message: types.Message):
+    if not is_owner(message):
+        return
+    tomorrow_date = (datetime.now(TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        tasks = conn.execute(
+            "SELECT id, title, deadline FROM tasks WHERE status = 'active' AND deadline LIKE ? ORDER BY deadline ASC",
+            (f"{tomorrow_date}%",),
+        ).fetchall()
+        orders = conn.execute(
+            "SELECT client, title, deadline FROM orders WHERE status = 'active' AND deadline LIKE ? ORDER BY deadline ASC",
+            (f"{tomorrow_date}%",),
+        ).fetchall()
 
-    session = user_sessions.pop(user_id, None)
-    if not session:
-        acc_info, reels_data = await asyncio.to_thread(scrape_public_stats)
-        session = {"acc": acc_info, "reels": reels_data, "private": {}}
+    if not tasks and not orders:
+        await message.answer(f"На завтра ({tomorrow_date}) пока пусто. Надиктуй задачи голосом!")
+        return
 
-    status = await bot.send_message(chat_id, f"🔍 Распознаю {len(paths)} скрин(а) и склеиваю с данными парсера...")
-    try:
-        for p in paths:
-            metrics = await asyncio.to_thread(extract_private_metrics, p)
-            for k, v in metrics.items():
-                session["private"][k] = max(session["private"].get(k, 0), v)
+    lines = [f"📅 **План на завтра ({(datetime.now(TZ) + timedelta(days=1)).strftime('%d.%m')}):**\n"]
+    for c, t, dl in orders:
+        tm = dl.split(" ")[1]
+        lines.append(f"🔥 **[СДАЧА ЗАКАЗА]** `{tm}` — {c}: {t}")
+    for tid, t, dl in tasks:
+        tm = dl.split(" ")[1]
+        lines.append(f"▫️ `{tm}` — {t}")
 
-        pdf_path = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        await asyncio.to_thread(build_final_pdf, session, pdf_path)
+    await message.answer("\n".join(lines), parse_mode="Markdown")
 
-        await bot.send_document(
-            chat_id=chat_id,
-            document=FSInputFile(pdf_path),
-            caption="📊 Полный гибридный отчёт готов (парсер + данные со скриншотов)."
+
+@dp.message(F.text.in_({"📝 Все задачи", "/tasks"}))
+async def show_all_tasks(message: types.Message):
+    if not is_owner(message):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        tasks = conn.execute(
+            "SELECT id, title, deadline FROM tasks WHERE status = 'active' ORDER BY deadline ASC"
+        ).fetchall()
+
+    if not tasks:
+        await message.answer("Активных задач нет — всё закрыто!")
+        return
+
+    await message.answer(f"📝 **Список задач ({len(tasks)}):**", parse_mode="Markdown")
+    for tid, title, dl in tasks:
+        dl_fmt = datetime.strptime(dl, "%Y-%m-%d %H:%M").strftime("%d.%m в %H:%M") if dl else "—"
+        await message.answer(
+            f"▫️ **{title}**\n⏰ `{dl_fmt}`",
+            reply_markup=task_inline_kb(tid),
+            parse_mode="Markdown",
         )
-        await status.delete()
-        os.remove(pdf_path)
+
+
+@dp.message(F.text.in_({"💰 Касса", "/money"}))
+async def show_money(message: types.Message):
+    if not is_owner(message):
+        return
+    month_prefix = datetime.now(TZ).strftime("%Y-%m")
+    with sqlite3.connect(DB_PATH) as conn:
+        # Получено за текущий месяц (по дате создания/обновления)
+        earned = conn.execute(
+            "SELECT COALESCE(SUM(paid_amount), 0) FROM orders WHERE created_at LIKE ?",
+            (f"{month_prefix}%",),
+        ).fetchone()[0]
+
+        # Ожидается доплат по активным заказам
+        pending_debt = conn.execute(
+            "SELECT COALESCE(SUM(total_amount - paid_amount), 0) FROM orders WHERE status = 'active'"
+        ).fetchone()[0]
+
+        active_count = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE status = 'active'"
+        ).fetchone()[0]
+
+    pct = min(100, round((earned / max(MONTHLY_GOAL, 1)) * 100))
+    filled = round(pct / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+
+    text = (
+        f"💰 **Финансы за {datetime.now(TZ).strftime('%m.%Y')}**\n\n"
+        f"🎯 Цель: `{MONTHLY_GOAL:,} ₽`\n"
+        f"💵 В кассе: `{earned:,} ₽` (**{pct}%**)\n"
+        f"`[{bar}]`\n\n"
+        f"⏳ Ожидается доплат по активным заказам: `{pending_debt:,} ₽`\n"
+        f"📦 Заказов в работе: `{active_count}`"
+    ).replace(",", " ")
+    await message.answer(text, parse_mode="Markdown")
+
+
+# ================= INLINE-КНОПКИ ДЕЙСТВИЙ =================
+@dp.callback_query(F.data.startswith("ord_"))
+async def handle_order_callbacks(call: types.CallbackQuery):
+    action, oid_str = call.data.split(":")
+    oid = int(oid_str)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT client, total_videos, done_videos, total_amount, paid_amount FROM orders WHERE id = ?",
+            (oid,),
+        ).fetchone()
+        if not row:
+            await call.answer("Заказ не найден")
+            return
+
+        client, tot_v, done_v, tot_a, paid_a = row
+
+        if action == "ord_vid":
+            new_done = min(tot_v, done_v + 1)
+            conn.execute("UPDATE orders SET done_videos = ? WHERE id = ?", (new_done, oid))
+            await call.answer(f"Прогресс: {new_done}/{tot_v}")
+            await call.message.edit_text(
+                f"✅ Обновлено: **{client}** — готово `{new_done}/{tot_v}` роликов.",
+                parse_mode="Markdown",
+            )
+        elif action == "ord_pay":
+            conn.execute("UPDATE orders SET paid_amount = ? WHERE id = ?", (tot_a, oid))
+            await call.answer("Оплата закрыта полностью!")
+            await call.message.edit_text(
+                f"💸 **{client}** закрыл остаток! Всего получено `{tot_a:,} ₽`.".replace(",", " "),
+                parse_mode="Markdown",
+            )
+        elif action == "ord_done":
+            conn.execute("UPDATE orders SET status = 'done', done_videos = ? WHERE id = ?", (tot_v, oid))
+            await call.answer("Заказ перенесён в выполненные!")
+            await call.message.edit_text(f"🎉 Заказ для **{client}** полностью сдан!", parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("tsk_done:"))
+async def handle_task_done(call: types.CallbackQuery):
+    tid = int(call.data.split(":")[1])
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+    await call.answer("Задача выполнена!")
+    await call.message.edit_text("✅ Задача выполнена и убрана из списка.")
+
+
+# ================= ПРИЁМ ГОЛОСА И ТЕКСТА =================
+async def process_natural_input(message: types.Message, raw_text: str):
+    status = await message.answer("⏳ Разбираю и записываю...")
+    try:
+        data = await parse_user_intent(raw_text)
+        now_created = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+        dl = data.get("deadline")
+        dl_pretty = datetime.strptime(dl, "%Y-%m-%d %H:%M").strftime("%d.%m.%Y в %H:%M") if dl else "не указан"
+
+        with sqlite3.connect(DB_PATH) as conn:
+            if data.get("type") == "order":
+                client = data.get("client") or "Клиент"
+                title = data.get("title") or "Монтаж Reels"
+                tot_v = int(data.get("total_videos") or 1)
+                tot_a = int(data.get("total_amount") or 0)
+                paid_a = int(data.get("paid_amount") or 0)
+
+                conn.execute(
+                    "INSERT INTO orders (client, title, total_videos, total_amount, paid_amount, deadline, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (client, title, tot_v, tot_a, paid_a, dl, now_created),
+                )
+                reply = (
+                    f"📦 **Записал новый заказ!**\n"
+                    f"👤 Клиент: **{client}**\n"
+                    f"🎬 Задача: {title} (`{tot_v}` шт.)\n"
+                    f"💵 Сумма: `{tot_a:,} ₽` (предоплата: `{paid_a:,} ₽`)\n"
+                    f"⏰ Дедлайн: `{dl_pretty}`\n\n"
+                    f"🔔 Напомню за 12ч, 6ч, 3ч и 1ч."
+                ).replace(",", " ")
+            else:
+                title = data.get("title") or raw_text
+                conn.execute(
+                    "INSERT INTO tasks (title, deadline, created_at) VALUES (?, ?, ?)",
+                    (title, dl, now_created),
+                )
+                reply = (
+                    f"📝 **Задача добавлена!**\n"
+                    f"▫️ {title}\n"
+                    f"⏰ Напомнить к: `{dl_pretty}`\n\n"
+                    f"🔔 Пуши придут за 12ч, 6ч, 3ч и 1ч."
+                )
+
+        await status.edit_text(reply, parse_mode="Markdown")
     except Exception as e:
-        await status.edit_text(f"Ошибка при сборке отчёта: {e}")
+        await status.edit_text(f"Не удалось разобрать сообщение: {e}")
+
+
+@dp.message(F.voice)
+async def handle_voice(message: types.Message):
+    if not is_owner(message):
+        return
+    os.makedirs("tmp_voice", exist_ok=True)
+    ogg_path = f"tmp_voice/{message.voice.file_unique_id}.ogg"
+
+    try:
+        await bot.download(message.voice, destination=ogg_path)
+        recognized = await asyncio.to_thread(transcribe_audio, ogg_path)
+        if not recognized:
+            await message.answer("Не удалось расслышать голос, попробуй ещё раз.")
+            return
+        await message.answer(f"🗣 *Распознал:* «{recognized}»", parse_mode="Markdown")
+        await process_natural_input(message, recognized)
     finally:
-        for p in paths:
-            if os.path.exists(p):
-                os.remove(p)
+        if os.path.exists(ogg_path):
+            os.remove(ogg_path)
 
 
-@dp.message(F.photo)
-async def handle_screenshots(message: types.Message):
-    user_id = message.from_user.id
-    photo = message.photo[-1]
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    if not is_owner(message):
+        return
+    await process_natural_input(message, message.text)
 
-    os.makedirs("tmp_screens", exist_ok=True)
-    img_path = f"tmp_screens/{user_id}_{photo.file_unique_id}.jpg"
-    await bot.download(photo, destination=img_path)
 
-    album_buffers.setdefault(user_id, []).append(img_path)
-    if user_id in album_tasks:
-        album_tasks[user_id].cancel()
-    album_tasks[user_id] = asyncio.create_task(finalize_with_screenshots(user_id, message.chat.id))
+# ================= ПЛАНИРОВЩИК НАПОМИНАНИЙ (12ч / 6ч / 3ч / 1ч) =================
+async def check_deadlines():
+    if ALLOWED_USER_ID == 0:
+        return
+
+    now = datetime.now(TZ)
+    thresholds = [
+        (720, "rem_12h", "12 часов"),
+        (360, "rem_6h", "6 часов"),
+        (180, "rem_3h", "3 часа"),
+        (60, "rem_1h", "1 час"),
+    ]
+
+    with sqlite3.connect(DB_PATH) as conn:
+        # 1. Проверяем заказы
+        orders = conn.execute(
+            "SELECT id, client, title, done_videos, total_videos, deadline, rem_12h, rem_6h, rem_3h, rem_1h "
+            "FROM orders WHERE status = 'active' AND deadline IS NOT NULL"
+        ).fetchall()
+
+        for row in orders:
+            oid, client, title, done_v, tot_v, dl_str, r12, r6, r3, r1 = row
+            dl = datetime.strptime(dl_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+            mins_left = (dl - now).total_seconds() / 60.0
+            if mins_left <= 0:
+                continue
+
+            flags = {"rem_12h": r12, "rem_6h": r6, "rem_3h": r3, "rem_1h": r1}
+            for limit_mins, col_name, label in thresholds:
+                if mins_left <= limit_mins and flags[col_name] == 0:
+                    conn.execute(f"UPDATE orders SET {col_name} = 1 WHERE id = ?", (oid,))
+                    # Отправляем уведомление только если мы попали в актуальное окно (не спамим прошедшими этапами)
+                    prev_limit = {720: 360, 360: 180, 180: 60, 60: 0}[limit_mins]
+                    if mins_left > prev_limit:
+                        await bot.send_message(
+                            ALLOWED_USER_ID,
+                            f"🔥 **Дедлайн заказа через {label}!**\n"
+                            f"👤 **{client}** — {title}\n"
+                            f"🎬 Готово: `{done_v}/{tot_v}` | Сдать до `{dl.strftime('%H:%M')}`",
+                            parse_mode="Markdown",
+                        )
+
+        # 2. Проверяем задачи
+        tasks = conn.execute(
+            "SELECT id, title, deadline, rem_12h, rem_6h, rem_3h, rem_1h "
+            "FROM tasks WHERE status = 'active' AND deadline IS NOT NULL"
+        ).fetchall()
+
+        for row in tasks:
+            tid, title, dl_str, r12, r6, r3, r1 = row
+            dl = datetime.strptime(dl_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+            mins_left = (dl - now).total_seconds() / 60.0
+            if mins_left <= 0:
+                continue
+
+            flags = {"rem_12h": r12, "rem_6h": r6, "rem_3h": r3, "rem_1h": r1}
+            for limit_mins, col_name, label in thresholds:
+                if mins_left <= limit_mins and flags[col_name] == 0:
+                    conn.execute(f"UPDATE tasks SET {col_name} = 1 WHERE id = ?", (tid,))
+                    prev_limit = {720: 360, 360: 180, 180: 60, 60: 0}[limit_mins]
+                    if mins_left > prev_limit:
+                        await bot.send_message(
+                            ALLOWED_USER_ID,
+                            f"⏰ **Напоминание (осталось {label}):**\n"
+                            f"▫️ {title}\n"
+                            f"Срок: `{dl.strftime('%d.%m в %H:%M')}`",
+                            parse_mode="Markdown",
+                        )
 
 
 async def main():
-    ensure_fonts()
-    print(f"Гибридный бот для @{IG_USERNAME} запущен! Напиши /report в Telegram.")
+    init_db()
+    scheduler = AsyncIOScheduler(timezone=TZ)
+    scheduler.add_job(check_deadlines, "interval", seconds=60)
+    scheduler.start()
+
+    print("Личный трекер и напоминалка запущены!")
     await dp.start_polling(bot)
 
 
